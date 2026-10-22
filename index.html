@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#000000">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<meta name="apple-mobile-web-app-title" content="Rayners Lane">
+<title>Rayners Lane Eastbound</title>
+<style>
+  :root { --amber: #ffb000; --dim: #7a5500; --bg: #000; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--amber);
+    font-family: "Courier New", ui-monospace, monospace;
+    padding: max(16px, env(safe-area-inset-top)) 16px 16px;
+  }
+  .board { max-width: 560px; margin: 0 auto; }
+  h1 { font-size: 1.1rem; margin: 0 0 4px; letter-spacing: .05em; text-transform: uppercase; }
+  .sub { color: var(--dim); font-size: .85rem; margin-bottom: 16px; }
+  ol { list-style: none; margin: 0; padding: 0; }
+  li {
+    display: grid; grid-template-columns: 1.6em 1fr auto; gap: 0 10px; align-items: baseline;
+    padding: 12px 0; border-bottom: 1px solid #222;
+  }
+  .num { color: var(--dim); }
+  .dest { font-size: 1.15rem; font-weight: bold; text-transform: uppercase; }
+  .eta { font-size: 1.3rem; font-weight: bold; text-align: right; white-space: nowrap; }
+  .meta { grid-column: 2 / 4; display: flex; justify-content: space-between; gap: 8px; font-size: .8rem; color: var(--dim); margin-top: 4px; }
+  .line { display: inline-block; padding: 1px 6px; border-radius: 3px; color: #fff; font-weight: bold; }
+  .metropolitan { background: #9b0056; }
+  .piccadilly { background: #003688; }
+  .msg { padding: 24px 0; color: var(--dim); }
+  .status { margin-top: 16px; font-size: .8rem; color: var(--dim); display: flex; justify-content: space-between; }
+  .status.error { color: #ff5050; }
+  .clock { font-size: 1.6rem; text-align: center; margin-top: 20px; }
+</style>
+</head>
+<body>
+<div class="board">
+  <h1>Rayners Lane &middot; Eastbound</h1>
+  <div class="sub">Metropolitan &amp; Piccadilly lines</div>
+  <ol id="list"><li class="msg">Loading…</li></ol>
+  <div class="status" id="status"><span id="updated"></span><span id="next"></span></div>
+  <div class="clock" id="clock"></div>
+</div>
+<script>
+  const STOP_ID = '940GZZLURYL';
+  const API = `https://api.tfl.gov.uk/Line/metropolitan,piccadilly/Arrivals/${STOP_ID}`;
+  const REFRESH_SECONDS = 20;
+  const MAX_ROWS = 6;
+
+  const timeFmt = new Intl.DateTimeFormat('en-GB', { hour: '2-digit', minute: '2-digit', timeZone: 'Europe/London' });
+  const clockFmt = new Intl.DateTimeFormat('en-GB', { hour: '2-digit', minute: '2-digit', second: '2-digit', timeZone: 'Europe/London' });
+
+  let trains = [];      // filtered predictions from the last successful fetch
+  let fetchedAt = 0;    // Date.now() at that fetch, used to count down locally
+  let nextFetchAt = 0;
+  let timer = null;
+
+  // TfL often leaves the destination blank; eastbound trains could be heading
+  // to several termini, so fall back to what the real board says
+  function destination(t) {
+    if (t.destinationName) return t.destinationName.replace(/ Underground Station$/, '');
+    if (t.towards && t.towards !== 'Check Front of Train') return t.towards;
+    return 'Check front of train';
+  }
+
+  async function refresh() {
+    clearTimeout(timer);
+    try {
+      const res = await fetch(API, { cache: 'no-store' });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      trains = data
+        .filter(t => (t.platformName || '').includes('Eastbound'))
+        .sort((a, b) => a.timeToStation - b.timeToStation);
+      fetchedAt = Date.now();
+      setStatus(`Updated ${timeFmt.format(fetchedAt)}`, false);
+    } catch (err) {
+      setStatus(`Update failed (${err.message}), retrying…`, true);
+    }
+    nextFetchAt = Date.now() + REFRESH_SECONDS * 1000;
+    render();
+    if (!document.hidden) timer = setTimeout(refresh, REFRESH_SECONDS * 1000);
+  }
+
+  function setStatus(text, isError) {
+    document.getElementById('updated').textContent = text;
+    document.getElementById('status').classList.toggle('error', isError);
+  }
+
+  function render() {
+    const list = document.getElementById('list');
+    const elapsed = (Date.now() - fetchedAt) / 1000;
+    const rows = trains
+      .map(t => ({ ...t, secs: t.timeToStation - elapsed }))
+      .filter(t => t.secs > -30)
+      .slice(0, MAX_ROWS);
+
+    if (!fetchedAt) return;
+    if (!rows.length) {
+      list.innerHTML = '<li class="msg">No eastbound trains predicted right now.</li>';
+      return;
+    }
+    list.innerHTML = rows.map((t, i) => {
+      const mins = Math.floor(Math.max(t.secs, 0) / 60);
+      const eta = mins === 0 ? 'Due' : `${mins} min`;
+      const at = timeFmt.format(new Date(fetchedAt + t.timeToStation * 1000));
+      return `<li>
+        <span class="num">${i + 1}</span>
+        <span class="dest">${destination(t)}</span>
+        <span class="eta">${eta}</span>
+        <div class="meta">
+          <span><span class="line ${t.lineId}">${t.lineName}</span> ${t.currentLocation || ''}</span>
+          <span>${at}</span>
+        </div>
+      </li>`;
+    }).join('');
+  }
+
+  function tick() {
+    document.getElementById('clock').textContent = clockFmt.format(new Date());
+    const left = Math.max(0, Math.ceil((nextFetchAt - Date.now()) / 1000));
+    document.getElementById('next').textContent = nextFetchAt ? `Refresh in ${left}s` : '';
+    render();
+  }
+
+  // Stop polling while the tab is in the background; refresh straight away on return
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) clearTimeout(timer);
+    else refresh();
+  });
+
+  refresh();
+  setInterval(tick, 1000);
+  tick();
+</script>
+</body>
+</html>
