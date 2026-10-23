@@ -31,7 +31,6 @@
   .line { display: inline-block; padding: 1px 6px; border-radius: 3px; color: #fff; font-weight: bold; }
   .metropolitan { background: #9b0056; }
   .piccadilly { background: #003688; }
-  .live { color: #3ddc84; font-weight: bold; }
   .msg { padding: 24px 0; color: var(--dim); }
   .status { margin-top: 16px; font-size: .8rem; color: var(--dim); display: flex; justify-content: space-between; }
   .status.error { color: #ff5050; }
@@ -41,180 +40,47 @@
 <body>
 <div class="board">
   <h1>Rayners Lane &middot; Eastbound</h1>
-  <div class="sub">Metropolitan &amp; Piccadilly &middot; <span class="live">LIVE</span> = real-time, others timetabled</div>
+  <div class="sub">Metropolitan &amp; Piccadilly lines</div>
   <ol id="list"><li class="msg">Loading…</li></ol>
   <div class="status" id="status"><span id="updated"></span><span id="next"></span></div>
   <div class="clock" id="clock"></div>
 </div>
 <script>
   const STOP_ID = '940GZZLURYL';
-  const LINES = ['metropolitan', 'piccadilly'];
-  const ARRIVALS_API = `https://api.tfl.gov.uk/Line/${LINES.join(',')}/Arrivals/${STOP_ID}`;
-  // At Rayners Lane, TfL's "outbound" is eastbound for both lines (towards Aldgate / Cockfosters)
-  const timetableApi = line => `https://api.tfl.gov.uk/Line/${line}/Timetable/${STOP_ID}?direction=outbound`;
+  const API = `https://api.tfl.gov.uk/Line/metropolitan,piccadilly/Arrivals/${STOP_ID}`;
   const REFRESH_SECONDS = 20;
-  const TIMETABLE_MAX_AGE = 6 * 3600 * 1000;
   const MAX_ROWS = 6;
-  // How far a live prediction may be from a timetabled departure to count as the same train
-  const MATCH_EARLY = 3 * 60 * 1000;
-  const MATCH_LATE = 10 * 60 * 1000;
 
   const timeFmt = new Intl.DateTimeFormat('en-GB', { hour: '2-digit', minute: '2-digit', timeZone: 'Europe/London' });
   const clockFmt = new Intl.DateTimeFormat('en-GB', { hour: '2-digit', minute: '2-digit', second: '2-digit', timeZone: 'Europe/London' });
-  const partsFmt = new Intl.DateTimeFormat('en-GB', {
-    timeZone: 'Europe/London', hourCycle: 'h23',
-    year: 'numeric', month: 'numeric', day: 'numeric', hour: 'numeric', minute: 'numeric',
-  });
 
-  let timetables = {};  // lineId -> { lineName, schedules: [{ name, journeys: [{ hour, minute, dest }] }] }
-  let timetableAt = 0;
-  let live = [];        // eastbound predictions, each with `at` = expected arrival (ms)
-  let liveAt = 0;
-  let rows = [];
+  let trains = [];      // filtered predictions from the last successful fetch
+  let fetchedAt = 0;    // Date.now() at that fetch, used to count down locally
   let nextFetchAt = 0;
   let timer = null;
 
-  // ---- London time helpers ----
-
-  function londonParts(t) {
-    const p = {};
-    for (const { type, value } of partsFmt.formatToParts(t)) p[type] = Number(value);
-    return p;
+  // TfL often leaves the destination blank; eastbound trains could be heading
+  // to several termini, so fall back to what the real board says
+  function destination(t) {
+    if (t.destinationName) return t.destinationName.replace(/ Underground Station$/, '');
+    if (t.towards && t.towards !== 'Check Front of Train') return t.towards;
+    return 'Check front of train';
   }
-
-  // Timetable hours can be 24+ for trains after midnight; Date.UTC rolls those over
-  function londonToUtc(y, month, d, h, min) {
-    const guess = Date.UTC(y, month - 1, d, h, min);
-    const p = londonParts(guess);
-    return guess - (Date.UTC(p.year, p.month - 1, p.day, p.hour, p.minute) - guess);
-  }
-
-  // ---- Timetable ----
-
-  function parseTimetable(data) {
-    const names = Object.fromEntries((data.stations || []).map(s => [s.id, s.name]));
-    const schedules = [];
-    for (const route of data.timetable.routes) {
-      const dest = {};
-      for (const si of route.stationIntervals) {
-        dest[si.id] = names[si.intervals[si.intervals.length - 1].stopId] || '';
-      }
-      for (const s of route.schedules) {
-        schedules.push({
-          name: s.name,
-          journeys: s.knownJourneys.map(j => ({ hour: +j.hour, minute: +j.minute, dest: dest[j.intervalId] })),
-        });
-      }
-    }
-    return { lineName: data.lineName, schedules };
-  }
-
-  async function loadTimetables() {
-    const loaded = await Promise.all(LINES.map(async line => {
-      const res = await fetch(timetableApi(line));
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      return parseTimetable(await res.json());
-    }));
-    LINES.forEach((line, i) => { timetables[line] = loaded[i]; });
-    timetableAt = Date.now();
-  }
-
-  // Schedule names look like "Monday - Thursday", "Friday", "Saturdays and Public Holidays",
-  // "Saturday (also Good Friday)", "Sunday"
-  function matchesDay(name, day) {
-    const n = name.toLowerCase();
-    if (day === 0) return n.startsWith('sunday');
-    if (day === 6) return n.startsWith('saturday');
-    if (day === 5) return n.startsWith('friday') || n.includes('monday - friday');
-    return n.startsWith('monday');
-  }
-
-  // TfL sometimes omits a weekday schedule (the Piccadilly has no "Monday - Thursday"),
-  // so fall back to another weekday one
-  function schedulesFor(tt, day) {
-    const found = tt.schedules.filter(s => matchesDay(s.name, day));
-    if (found.length || day === 0 || day === 6) return found;
-    return tt.schedules.filter(s => /^(monday|friday)/i.test(s.name));
-  }
-
-  // Yesterday's service is included for trains after midnight (hour 24+)
-  function scheduledDepartures() {
-    const today = londonParts(Date.now());
-    const out = [];
-    for (const back of [1, 0]) {
-      const date = new Date(Date.UTC(today.year, today.month - 1, today.day - back));
-      const [y, month, d] = [date.getUTCFullYear(), date.getUTCMonth() + 1, date.getUTCDate()];
-      for (const [lineId, tt] of Object.entries(timetables)) {
-        for (const s of schedulesFor(tt, date.getUTCDay())) {
-          for (const j of s.journeys) {
-            out.push({ lineId, lineName: tt.lineName, dest: j.dest, sched: londonToUtc(y, month, d, j.hour, j.minute) });
-          }
-        }
-      }
-    }
-    return out;
-  }
-
-  // ---- Combining live and timetable ----
-
-  function cleanName(name) {
-    return (name || '').replace(/ Underground Station$/, '');
-  }
-
-  function buildRows() {
-    const now = Date.now();
-    const sched = scheduledDepartures()
-      .filter(s => s.sched > now - MATCH_LATE)
-      .sort((a, b) => a.sched - b.sched);
-    const used = new Set();
-    const out = [];
-
-    for (const t of live) {
-      let best = null;
-      for (const s of sched) {
-        if (used.has(s) || s.lineId !== t.lineId) continue;
-        const diff = t.at - s.sched;
-        if (diff < -MATCH_EARLY || diff > MATCH_LATE) continue;
-        if (!best || Math.abs(diff) < Math.abs(t.at - best.sched)) best = s;
-      }
-      if (best) used.add(best);
-      out.push({
-        lineId: t.lineId, lineName: t.lineName, at: t.at, live: true, location: t.currentLocation,
-        dest: t.destinationName || (best && best.dest), sched: best && best.sched,
-      });
-    }
-    for (const s of sched) {
-      if (!used.has(s)) out.push({ ...s, at: s.sched, live: false });
-    }
-    return out.sort((a, b) => a.at - b.at);
-  }
-
-  // ---- Fetching ----
 
   async function refresh() {
     clearTimeout(timer);
-    const problems = [];
-
-    if (Date.now() - timetableAt > TIMETABLE_MAX_AGE) {
-      try { await loadTimetables(); } catch (err) { problems.push(`timetable ${err.message}`); }
-    }
     try {
-      const res = await fetch(ARRIVALS_API, { cache: 'no-store' });
+      const res = await fetch(API, { cache: 'no-store' });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
-      liveAt = Date.now();
-      live = data
+      trains = data
         .filter(t => (t.platformName || '').includes('Eastbound'))
-        .map(t => ({ ...t, at: liveAt + t.timeToStation * 1000 }))
-        .sort((a, b) => a.at - b.at);
+        .sort((a, b) => a.timeToStation - b.timeToStation);
+      fetchedAt = Date.now();
+      setStatus(`Updated ${timeFmt.format(fetchedAt)}`, false);
     } catch (err) {
-      problems.push(`live ${err.message}`);
+      setStatus(`Update failed (${err.message}), retrying…`, true);
     }
-
-    rows = buildRows();
-    if (problems.length) setStatus(`Update failed (${problems.join(', ')}), retrying…`, true);
-    else setStatus(`Updated ${timeFmt.format(liveAt)}`, false);
-
     nextFetchAt = Date.now() + REFRESH_SECONDS * 1000;
     render();
     if (!document.hidden) timer = setTimeout(refresh, REFRESH_SECONDS * 1000);
@@ -225,30 +91,29 @@
     document.getElementById('status').classList.toggle('error', isError);
   }
 
-  // ---- Rendering ----
-
   function render() {
-    if (!liveAt && !timetableAt) return;
     const list = document.getElementById('list');
-    const now = Date.now();
-    const shown = rows.filter(r => r.at > now - 30 * 1000).slice(0, MAX_ROWS);
+    const elapsed = (Date.now() - fetchedAt) / 1000;
+    const rows = trains
+      .map(t => ({ ...t, secs: t.timeToStation - elapsed }))
+      .filter(t => t.secs > -30)
+      .slice(0, MAX_ROWS);
 
-    if (!shown.length) {
-      list.innerHTML = '<li class="msg">No eastbound trains found right now.</li>';
+    if (!fetchedAt) return;
+    if (!rows.length) {
+      list.innerHTML = '<li class="msg">No eastbound trains predicted right now.</li>';
       return;
     }
-    list.innerHTML = shown.map((r, i) => {
-      const mins = Math.floor(Math.max(r.at - now, 0) / 60000);
+    list.innerHTML = rows.map((t, i) => {
+      const mins = Math.floor(Math.max(t.secs, 0) / 60);
       const eta = mins === 0 ? 'Due' : `${mins} min`;
-      const status = r.live ? `<span class="live">LIVE</span> ${r.location || ''}` : 'Timetabled';
-      let at = timeFmt.format(r.at);
-      if (r.live && r.sched && Math.abs(r.at - r.sched) >= 60 * 1000) at += ` (sched ${timeFmt.format(r.sched)})`;
+      const at = timeFmt.format(new Date(fetchedAt + t.timeToStation * 1000));
       return `<li>
         <span class="num">${i + 1}</span>
-        <span class="dest">${cleanName(r.dest) || 'Check front of train'}</span>
+        <span class="dest">${destination(t)}</span>
         <span class="eta">${eta}</span>
         <div class="meta">
-          <span><span class="line ${r.lineId}">${r.lineName}</span> ${status}</span>
+          <span><span class="line ${t.lineId}">${t.lineName}</span> ${t.currentLocation || ''}</span>
           <span>${at}</span>
         </div>
       </li>`;
